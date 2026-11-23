@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+!.env.example
+backend/api/src/generated/
+
+backend/api/dist/
+backend/admin/dist/
+backend/admin/*.tsbuildinfo
+backend/api/.admin-credentials
+
+storage/
+
+tmp/
+output/
+
+.DS_Store

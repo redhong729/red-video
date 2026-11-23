@@ -1,0 +1,343 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model HomeConfiguration {
+  id         String   @id @default("default")
+  featured   Json
+  popular    Json
+  ranking    Json
+  configured Boolean  @default(false)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("home_configuration")
+}
+
+model AdminUser {
+  id           String         @id @default(uuid()) @db.Uuid
+  username     String         @unique
+  passwordHash String         @map("password_hash")
+  enabled      Boolean        @default(true)
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  sessions     AdminSession[]
+
+  @@map("admin_users")
+}
+
+model AdminSession {
+  tokenHash String    @id @map("token_hash")
+  userId    String    @map("user_id") @db.Uuid
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  user      AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("admin_sessions")
+}
+
+// 业务身份与草稿分开，后续可引入独立的线上生效版本。
+model Drama {
+  id        String      @id @default(uuid()) @db.Uuid
+  status    String      @default("DRAFT")
+  createdAt DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+  draft     DramaDraft?
+  episodes  Episode[]
+  mediaBatches MediaBatch[]
+  visibilityEvents VisibilityEvent[]
+  reviewItems ReviewItem[]
+  publication DramaPublication?
+  publicationRevisions PublicationRevision[]
+
+  @@index([updatedAt, id])
+  @@map("dramas")
+}
+
+model DramaDraft {
+  dramaId        String             @id @map("drama_id") @db.Uuid
+  drama          Drama              @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  categoryId     String?            @map("category_id") @db.Uuid
+  category       Category?          @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  totalEpisodes  Int?               @map("total_episodes")
+  sortOrder      Int                @default(0) @map("sort_order")
+  pricingMode    String?            @map("pricing_mode")
+  freeEpisodes   Int?               @map("free_episodes")
+  priceCredits   Int?               @map("price_credits")
+  previewSeconds Int                @default(30) @map("preview_seconds")
+  coverKey       String?            @map("cover_key")
+  // 历史手动排序标记暂保留；列表不再使用。
+  episodeOrderCustomized Boolean    @default(false) @map("episode_order_customized")
+  translations   DramaTranslation[]
+  actors         DramaActor[]
+  tags           DramaTag[]
+
+  @@index([categoryId])
+  @@map("drama_drafts")
+}
+
+model DramaTranslation {
+  dramaId     String     @map("drama_id") @db.Uuid
+  locale      String
+  title       String?
+  description String?
+  draft       DramaDraft @relation(fields: [dramaId], references: [dramaId], onDelete: Cascade)
+
+  @@id([dramaId, locale])
+  @@map("drama_translations")
+}
+
+model DramaActor {
+  id       String     @id @default(uuid()) @db.Uuid
+  dramaId  String     @map("drama_id") @db.Uuid
+  name     String
+  roleName String?    @map("role_name")
+  position Int
+  draft    DramaDraft @relation(fields: [dramaId], references: [dramaId], onDelete: Cascade)
+
+  @@unique([dramaId, position])
+  @@map("drama_actors")
+}
+
+model Category {
+  id           String                @id @default(uuid()) @db.Uuid
+  active       Boolean               @default(true)
+  translations CategoryTranslation[]
+  drafts       DramaDraft[]
+
+  @@map("categories")
+}
+
+model CategoryTranslation {
+  categoryId String   @map("category_id") @db.Uuid
+  locale     String
+  name       String
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([categoryId, locale])
+  @@map("category_translations")
+}
+
+model Tag {
+  id           String           @id @default(uuid()) @db.Uuid
+  active       Boolean          @default(true)
+  systemKey    String?          @unique @map("system_key")
+  translations TagTranslation[]
+  dramas       DramaTag[]
+
+  @@map("tags")
+}
+
+model TagTranslation {
+  tagId  String @map("tag_id") @db.Uuid
+  locale String
+  name   String
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([tagId, locale])
+  @@map("tag_translations")
+}
+
+model DramaTag {
+  dramaId String     @map("drama_id") @db.Uuid
+  tagId   String     @map("tag_id") @db.Uuid
+  draft   DramaDraft @relation(fields: [dramaId], references: [dramaId], onDelete: Cascade)
+  tag     Tag        @relation(fields: [tagId], references: [id], onDelete: Restrict)
+
+  @@id([dramaId, tagId])
+  @@index([tagId])
+  @@map("drama_tags")
+}
+
+model Episode {
+  id             String               @id @default(uuid()) @db.Uuid
+  dramaId        String               @map("drama_id") @db.Uuid
+  drama          Drama                @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  number         Int
+  position       Int                  // 历史排序值，仅保留数据。
+  status         String               @default("OFFLINE")
+  priceMode      String?              @map("price_mode")
+  priceCredits   Int?                 @map("price_credits")
+  previewSeconds Int?                 @map("preview_seconds")
+  createdAt      DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  translations   EpisodeTranslation[]
+  uploads        MediaUpload[]        @relation("EpisodeUploads")
+  draftMediaId   String?              @unique @map("draft_media_id") @db.Uuid
+  draftMedia     MediaUpload?         @relation("SelectedEpisodeMedia", fields: [draftMediaId], references: [id], onDelete: SetNull)
+  pendingMediaId String?              @unique @map("pending_media_id") @db.Uuid
+  pendingMedia   MediaUpload?         @relation("PendingEpisodeMedia", fields: [pendingMediaId], references: [id], onDelete: SetNull)
+  visibilityEvents VisibilityEvent[]
+  reviewItems ReviewItem[]
+  publication EpisodePublication?
+  publicationRevisions PublicationRevision[]
+
+  @@unique([dramaId, number])
+  @@index([dramaId, position])
+  @@map("episodes")
+}
+
+model ReviewItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  sequence    BigInt   @unique @default(autoincrement())
+  dramaId     String   @map("drama_id") @db.Uuid
+  drama       Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  episodeId   String?  @map("episode_id") @db.Uuid
+  episode     Episode? @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  kind        String
+  fingerprint String
+  snapshot    Json
+  status      String   @default("PENDING")
+  submittedBy String   @map("submitted_by")
+  submittedAt DateTime @default(now()) @map("submitted_at") @db.Timestamptz(3)
+  reviewedBy  String?  @map("reviewed_by")
+  reviewedAt  DateTime? @map("reviewed_at") @db.Timestamptz(3)
+  note        String?
+  dramaPublications DramaPublication[]
+  episodePublications EpisodePublication[]
+
+  @@index([dramaId, submittedAt])
+  @@index([episodeId, submittedAt])
+  @@map("review_items")
+}
+
+model DramaPublication {
+  dramaId     String   @id @map("drama_id") @db.Uuid
+  drama       Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  reviewId    String?  @map("review_id") @db.Uuid
+  review      ReviewItem? @relation(fields: [reviewId], references: [id], onDelete: Restrict)
+  revisionId  String?  @map("revision_id") @db.Uuid
+  revision    PublicationRevision? @relation("DramaCurrentRevision", fields: [revisionId], references: [id], onDelete: Restrict)
+  fingerprint String
+  snapshot    Json
+  publishedAt DateTime @default(now()) @map("published_at") @db.Timestamptz(3)
+  publishedBy String   @map("published_by")
+
+  @@map("drama_publications")
+}
+
+model EpisodePublication {
+  episodeId   String   @id @map("episode_id") @db.Uuid
+  episode     Episode  @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  reviewId    String?  @map("review_id") @db.Uuid
+  review      ReviewItem? @relation(fields: [reviewId], references: [id], onDelete: Restrict)
+  revisionId  String?  @map("revision_id") @db.Uuid
+  revision    PublicationRevision? @relation("EpisodeCurrentRevision", fields: [revisionId], references: [id], onDelete: Restrict)
+  fingerprint String
+  snapshot    Json
+  publishedAt DateTime @default(now()) @map("published_at") @db.Timestamptz(3)
+  publishedBy String   @map("published_by")
+
+  @@map("episode_publications")
+}
+
+// 发布快照独立于已停用的审核流程，保留版本及操作者。
+model PublicationRevision {
+  id          String   @id @default(uuid()) @db.Uuid
+  dramaId     String   @map("drama_id") @db.Uuid
+  drama       Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  episodeId   String?  @map("episode_id") @db.Uuid
+  episode     Episode? @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  kind        String
+  fingerprint String
+  snapshot    Json
+  createdBy   String   @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  dramaCurrent DramaPublication[] @relation("DramaCurrentRevision")
+  episodeCurrent EpisodePublication[] @relation("EpisodeCurrentRevision")
+
+  @@index([dramaId, createdAt])
+  @@map("publication_revisions")
+}
+
+// 留存上下架操作人、对象与状态变化，自动联动也有单独记录。
+model VisibilityEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  dramaId   String   @map("drama_id") @db.Uuid
+  drama     Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  episodeId String?  @map("episode_id") @db.Uuid
+  episode   Episode? @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  actor     String
+  action    String
+  fromStatus String  @map("from_status")
+  toStatus   String  @map("to_status")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([dramaId, createdAt])
+  @@map("visibility_events")
+}
+
+model EpisodeTranslation {
+  episodeId String  @map("episode_id") @db.Uuid
+  locale    String
+  title     String
+  episode   Episode @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  @@id([episodeId, locale])
+  @@map("episode_translations")
+}
+
+// 每次上传均为独立候选媒体，不覆盖已有版本。
+model MediaBatch {
+  id        String        @id @default(uuid()) @db.Uuid
+  dramaId   String        @map("drama_id") @db.Uuid
+  drama     Drama         @relation(fields: [dramaId], references: [id], onDelete: Restrict)
+  createdBy String        @map("created_by")
+  createdAt DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  expiresAt DateTime      @map("expires_at") @db.Timestamptz(3)
+  items     MediaUpload[]
+
+  @@index([dramaId, createdAt])
+  @@map("media_batches")
+}
+
+model MediaUpload {
+  id              String       @id @default(uuid()) @db.Uuid
+  batchId         String       @map("batch_id") @db.Uuid
+  batch           MediaBatch   @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  episodeId       String       @map("episode_id") @db.Uuid
+  episode         Episode      @relation("EpisodeUploads", fields: [episodeId], references: [id], onDelete: Restrict)
+  selectedFor     Episode?     @relation("SelectedEpisodeMedia")
+  pendingFor      Episode?     @relation("PendingEpisodeMedia")
+  filename        String
+  size            Int
+  fingerprint     String
+  chunkSize       Int          @map("chunk_size")
+  chunkCount      Int          @map("chunk_count")
+  status          String       @default("UPLOADING")
+  phase           String       @default("UPLOAD")
+  detectStatus    String       @default("PENDING") @map("detect_status")
+  transcodeStatus String       @default("PENDING") @map("transcode_status")
+  coverStatus     String       @default("PENDING") @map("cover_status")
+  previewStatus   String       @default("PENDING") @map("preview_status")
+  error           String?
+  duration        Float?
+  hasAudio        Boolean?     @map("has_audio")
+  previewSeconds  Int?         @map("preview_seconds")
+  previewSignature String?     @map("preview_signature")
+  selectedCover   String?      @map("selected_cover")
+  uploadedAt      DateTime?    @map("uploaded_at") @db.Timestamptz(3)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+  chunks          MediaChunk[]
+
+  @@index([episodeId, status])
+  @@index([status, createdAt])
+  @@map("media_uploads")
+}
+
+model MediaChunk {
+  uploadId String      @map("upload_id") @db.Uuid
+  upload   MediaUpload @relation(fields: [uploadId], references: [id], onDelete: Cascade)
+  number   Int
+  size     Int
+  sha256   String
+
+  @@id([uploadId, number])
+  @@map("media_chunks")
+}

@@ -1,0 +1,136 @@
+import 'dotenv/config';
+import { randomBytes, randomUUID, createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '../dist/generated/prisma/client.js';
+import { hashPassword } from '../dist/password.js';
+import { previewConfig } from '../dist/preview-config.js';
+
+const base = process.env.TEST_API_URL, origin = process.env.ADMIN_ORIGIN ?? 'http://127.0.0.1:3001';
+test('direct confirmation, validation, version isolation and restoration', { skip: !base, timeout: 60000 }, async () => {
+  const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) });
+  const username = `pub_test_${randomBytes(8).toString('hex')}`, password = randomBytes(24).toString('base64url');
+  let user, dramaId, categoryId, batchId; const mediaIds = [], extraBatches = [];
+  const storage = resolve('../../storage');
+  try {
+    user = await prisma.adminUser.create({ data: { username, passwordHash: await hashPassword(password) } });
+    const category = await prisma.category.create({ data: { translations: { create: { locale: 'en', name: username } } } }); categoryId = category.id;
+    const coverKey = `${randomUUID()}.jpg`;
+    const drama = await prisma.drama.create({ data: { draft: { create: { categoryId, coverKey, totalEpisodes: 5, pricingMode: 'FREE', previewSeconds: 0, translations: { create: [{ locale: 'en', title: 'A title', description: 'A description' }] } } }, episodes: { create: [{ number: 1, position: 1 }, { number: 2, position: 2 }] } }, include: { draft: true, episodes: { orderBy: { number: 'asc' } } } });
+    dramaId = drama.id; const epIds = drama.episodes.map((item) => item.id);
+    const coverDir = join(storage, 'drama-covers', dramaId); await mkdir(coverDir, { recursive: true }); await writeFile(join(coverDir, coverKey), Buffer.from('test cover'));
+    const batch = await prisma.mediaBatch.create({ data: { dramaId, createdBy: username, expiresAt: new Date(Date.now() + 86400000) } }); batchId = batch.id;
+    async function makeMedia(ep, fingerprint) {
+      const media = await prisma.mediaUpload.create({ data: { batchId, episodeId: ep.id, filename: 'test.mp4', size: 1, fingerprint, chunkSize: 1, chunkCount: 1, status: 'READY', phase: 'DONE', detectStatus: 'SUCCEEDED', transcodeStatus: 'SUCCEEDED', coverStatus: 'SUCCEEDED', previewStatus: 'NOT_REQUIRED', previewSignature: previewConfig(drama.draft, ep).signature, uploadedAt: new Date(), duration: 10 } });
+      mediaIds.push(media.id); await prisma.episode.update({ where: { id: ep.id }, data: { draftMediaId: media.id } });
+      const dir = join(storage, 'media', media.id); await mkdir(dir, { recursive: true }); await writeFile(join(dir, 'output.mp4'), Buffer.from('test video data')); return media;
+    }
+    for (const ep of drama.episodes) await makeMedia(ep, 'a'.repeat(64));
+    const call = (path, options = {}) => fetch(`${base}${path}`, { ...options, headers: { origin, ...options.headers } });
+    const login = await call('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username, password }) });
+    assert.equal(login.status, 200); const cookie = login.headers.get('set-cookie').split(';')[0];
+    const post = (path, body) => call(path, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const read = async (path) => { const response = await call(path, { headers: { cookie } }); assert.equal(response.status, 200); return response.json(); };
+    const url = `/api/publication/dramas/${dramaId}`;
+    const confirm = (report, ids, version = 'draft') => { const rows = report.episodes.filter((item) => ids.includes(item.id)); return { version, dramaFingerprint: report.drama.fingerprint, dramaStatus: report.drama.status, episodeIds: ids, episodeFingerprints: Object.fromEntries(rows.map((row) => [row.id, row.fingerprint])), episodeStatuses: Object.fromEntries(rows.map((row) => [row.id, row.status])) }; };
+    const draftBody = { translations: [{ locale: 'en', title: 'A title', description: 'A description' }], categoryId, tagIds: [], actors: [], totalEpisodes: 5, sortOrder: 0, pricingMode: 'FREE', freeEpisodes: null, priceCredits: null, previewSeconds: 0 };
+    const save = (body) => call(`/api/dramas/${dramaId}`, { method: 'PUT', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const first = await read(url); assert.deepEqual(first.blockers, []); assert.ok(first.warnings.includes('NO_ACTORS')); assert.ok(first.warnings.includes('NO_TAGS')); assert.ok(first.warnings.includes('EPISODES_INCOMPLETE')); assert.ok(first.episodes[0].warnings.includes('EPISODE_COVER_MISSING'));
+    assert.equal((await post(`${url}/publish`, { episodeIds: epIds })).status, 400, 'explicit confirmation must include the checked versions');
+    assert.equal((await post(`${url}/submit`, { episodeIds: epIds })).status, 404, 'review submission has been removed');
+    assert.equal((await save({ ...draftBody, categoryId: null })).status, 200);
+    assert.ok((await read(url)).blockers.includes('CATEGORY_REQUIRED'));
+    assert.equal((await save({ ...draftBody, pricingMode: null })).status, 200);
+    assert.ok((await read(url)).blockers.includes('PRICING_REQUIRED'));
+    await prisma.dramaDraft.update({ where: { dramaId }, data: { coverKey: null, totalEpisodes: null } });
+    const missingBasics = await read(url); assert.ok(missingBasics.blockers.includes('COVER_REQUIRED')); assert.ok(missingBasics.blockers.includes('TOTAL_REQUIRED'));
+    await prisma.dramaDraft.update({ where: { dramaId }, data: { coverKey, totalEpisodes: 5 } });
+    assert.equal((await save({ ...draftBody, pricingMode: 'PER_EPISODE', freeEpisodes: 0, priceCredits: 5, previewSeconds: 12 })).status, 200);
+    assert.ok((await read(url)).episodes[0].blockers.includes('PREVIEW_REQUIRED'), 'paid preview cannot expose a full episode');
+    await prisma.episode.update({ where: { id: epIds[0] }, data: { draftMediaId: null } });
+    assert.ok((await read(url)).episodes[0].blockers.includes('MEDIA_REQUIRED'));
+    await prisma.episode.update({ where: { id: epIds[0] }, data: { draftMediaId: mediaIds[0] } });
+    assert.equal((await save({ ...draftBody, translations: [{ locale: 'en', title: 'A title', description: '' }] })).status, 200);
+    const missing = await read(url); assert.ok(missing.blockers.includes('ENGLISH_REQUIRED'));
+    assert.equal((await post(`${url}/publish`, confirm(missing, epIds))).status, 409, 'missing required information blocks publication');
+    assert.equal((await save(draftBody)).status, 200);
+    const stale = await read(url);
+    await rm(join(coverDir, coverKey));
+    assert.equal((await post(`${url}/publish`, confirm(stale, epIds))).status, 409, 'missing files are rechecked during confirmation');
+    await writeFile(join(coverDir, coverKey), Buffer.from('test cover'));
+    const changedBody = { ...draftBody, translations: [{ locale: 'en', title: 'Changed draft', description: 'A description' }] };
+    assert.equal((await save(changedBody)).status, 200);
+    assert.equal((await post(`${url}/publish`, confirm(stale, epIds))).status, 409, 'a stale confirmation cannot publish changed content');
+    let current = await read(url); assert.equal((await post(`${url}/publish`, confirm(current, epIds))).status, 201, 'optional warnings do not block publication');
+    assert.equal((await prisma.reviewItem.count({ where: { dramaId } })), 0, 'publishing does not fabricate review records');
+    assert.equal((await prisma.drama.findUnique({ where: { id: dramaId } })).status, 'PUBLISHED');
+    assert.equal((await prisma.episode.count({ where: { dramaId, status: 'PUBLISHED' } })), 2);
+    const firstPublished = await prisma.dramaPublication.findUnique({ where: { dramaId } }); assert.equal(firstPublished.reviewId, null); assert.ok(firstPublished.revisionId);
+    const initialRevisions = await prisma.publicationRevision.count({ where: { dramaId } });
+    current = await read(url); assert.equal((await post(`${url}/publish`, confirm(current, epIds))).status, 201);
+    assert.equal(await prisma.publicationRevision.count({ where: { dramaId } }), initialRevisions, 'repeated publication does not create revisions');
+    const beforeOffline = await read(url);
+    assert.equal((await post('/api/visibility/dramas/offline', { ids: [dramaId] })).status, 201);
+    assert.equal((await post(`${url}/publish`, confirm(beforeOffline, epIds))).status, 409, 'a stale confirmation cannot undo a later takedown');
+    current = await read(`${url}?version=live`);
+    assert.equal((await post(`${url}/publish`, confirm(current, [epIds[0]], 'live'))).status, 409, 'restore explicitly includes all still-published episodes');
+    assert.equal((await post(`${url}/publish`, confirm(current, epIds, 'live'))).status, 201);
+    assert.equal((await post(`/api/visibility/dramas/${dramaId}/episodes/offline`, { ids: [epIds[1]] })).status, 201);
+    if (process.env.TEST_MEDIA === '1') {
+      const sample = join(storage, 'media', mediaIds[0], 'replacement-test.mp4');
+      execFileSync('ffmpeg', ['-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=120x180:rate=12', '-t', '1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', sample]);
+      const bytes = await readFile(sample), digest = createHash('sha256').update(bytes).digest('hex'), fingerprint = createHash('sha256').update(Buffer.from(digest, 'hex')).digest('hex');
+      const next = await post('/api/media/batches', { dramaId, items: [{ filename: '01.mp4', size: bytes.length, number: 1, fingerprint, replace: true }] });
+      assert.equal(next.status, 201); const extra = await next.json(); extraBatches.push(extra.id); const newMedia = extra.items[0]; mediaIds.push(newMedia.id);
+      current = await read(`${url}?version=live`);
+      assert.equal((await post(`${url}/publish`, confirm(current, [epIds[0]], 'live'))).status, 409, 'selected active uploads block publication');
+      assert.equal((await call(`/api/media/items/${newMedia.id}/chunks/0`, { method: 'PUT', headers: { cookie, 'content-type': 'application/octet-stream', 'x-chunk-sha256': digest }, body: bytes })).status, 200);
+      assert.equal((await post(`/api/media/items/${newMedia.id}/complete`, {})).status, 201);
+      let state; for (let i = 0; i < 400; i++) { state = await prisma.mediaUpload.findUnique({ where: { id: newMedia.id } }); if (['READY', 'FAILED', 'CANCELLED'].includes(state.status)) break; await new Promise((r) => setTimeout(r, 100)); }
+      assert.equal(state.status, 'READY', state.error);
+      assert.equal((await prisma.episodePublication.findUnique({ where: { episodeId: epIds[0] } })).snapshot.mediaId, mediaIds[0], 'replacement keeps published media unchanged');
+    }
+    const publishedBeforeEdit = await prisma.dramaPublication.findUnique({ where: { dramaId } });
+    const unrelatedDraft = { ...changedBody, totalEpisodes: 6, pricingMode: 'PER_EPISODE', freeEpisodes: 0, priceCredits: 5, translations: [{ locale: 'en', title: 'Unpublished draft', description: 'A description' }] };
+    assert.equal((await save(unrelatedDraft)).status, 200);
+    assert.deepEqual((await prisma.dramaPublication.findUnique({ where: { dramaId } })).snapshot, publishedBeforeEdit.snapshot);
+    const thirdResponse = await post(`/api/dramas/${dramaId}/episodes`, { number: 3, translations: [], priceMode: null, priceCredits: null, previewSeconds: null }); assert.equal(thirdResponse.status, 201); const third = await thirdResponse.json(); await makeMedia(third, 'c'.repeat(64));
+    current = await read(`${url}?version=live`); assert.deepEqual(current.blockers, []); assert.equal(current.episodes.find((item) => item.id === third.id).blockers.length, 0);
+    assert.equal((await post(`${url}/publish`, confirm(current, [third.id], 'live'))).status, 201, 'independent episode uses the original published drama version');
+    assert.equal((await prisma.dramaPublication.findUnique({ where: { dramaId } })).snapshot.translations[0].title, 'Changed draft');
+    assert.equal((await prisma.episodePublication.findUnique({ where: { episodeId: third.id } })).snapshot.effectivePrice.mode, 'FREE');
+    current = await read(url);
+    assert.equal((await post(`${url}/publish`, confirm(current, [third.id]))).status, 409, 'shared changes cannot skip affected published episodes');
+    const sixth = await post(`/api/dramas/${dramaId}/episodes`, { number: 6, translations: [], priceMode: null, priceCredits: null, previewSeconds: null }); assert.equal(sixth.status, 201); const sixthId = (await sixth.json()).id;
+    assert.ok((await read(`${url}?version=live`)).episodes.find((row) => row.id === sixthId).blockers.includes('EPISODE_EXCEEDS_TOTAL'));
+    const oldEpisode = await prisma.episodePublication.findUnique({ where: { episodeId: epIds[0] } });
+    assert.equal((await post('/api/visibility/dramas/offline', { ids: [dramaId] })).status, 201);
+    current = await read(`${url}?version=live`); assert.equal(current.episodes.find((row) => row.id === epIds[0]).useSaved, true);
+    const savedVideo = await call(`${url}/episodes/${epIds[0]}/video`, { headers: { cookie, range: 'bytes=0-3' } }); assert.equal(savedVideo.status, 206); assert.equal(Buffer.from(await savedVideo.arrayBuffer()).toString(), 'test');
+    assert.equal((await post(`${url}/publish`, confirm(current, [epIds[0], third.id], 'live'))).status, 201);
+    assert.deepEqual((await prisma.episodePublication.findUnique({ where: { episodeId: epIds[0] } })).snapshot, oldEpisode.snapshot);
+    assert.equal((await prisma.episode.findUnique({ where: { id: epIds[1] } })).status, 'OFFLINE', 'restore does not automatically revive offline episodes');
+    // Existing publications linked to past reviews remain readable and restorable.
+    const legacyDrama = await prisma.reviewItem.create({ data: { dramaId, kind: 'DRAMA', fingerprint: firstPublished.fingerprint, snapshot: firstPublished.snapshot, status: 'APPROVED', submittedBy: username } });
+    const legacyEpisode = await prisma.reviewItem.create({ data: { dramaId, episodeId: epIds[0], kind: 'EPISODE', fingerprint: oldEpisode.fingerprint, snapshot: oldEpisode.snapshot, status: 'APPROVED', submittedBy: username } });
+    await prisma.dramaPublication.update({ where: { dramaId }, data: { reviewId: legacyDrama.id, revisionId: null } });
+    await prisma.episodePublication.update({ where: { episodeId: epIds[0] }, data: { reviewId: legacyEpisode.id, revisionId: null } });
+    assert.equal((await post('/api/visibility/dramas/offline', { ids: [dramaId] })).status, 201);
+    current = await read(`${url}?version=live`); assert.equal((await post(`${url}/publish`, confirm(current, [epIds[0], third.id], 'live'))).status, 201);
+    assert.equal((await prisma.reviewItem.count({ where: { dramaId } })), 2, 'historical audit records remain intact');
+  } finally {
+    if (dramaId) { await prisma.dramaPublication.deleteMany({ where: { dramaId } }); await prisma.episodePublication.deleteMany({ where: { episode: { dramaId } } }); }
+    if (extraBatches.length) await prisma.mediaBatch.deleteMany({ where: { id: { in: extraBatches } } });
+    if (batchId) await prisma.mediaBatch.delete({ where: { id: batchId } });
+    if (dramaId) await prisma.drama.delete({ where: { id: dramaId } });
+    if (categoryId) await prisma.category.delete({ where: { id: categoryId } });
+    if (user) await prisma.adminUser.delete({ where: { id: user.id } });
+    await prisma.$disconnect();
+    for (const id of mediaIds) await rm(join(storage, 'media', id), { recursive: true, force: true });
+    if (dramaId) await rm(join(storage, 'drama-covers', dramaId), { recursive: true, force: true });
+  }
+});

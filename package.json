@@ -1,0 +1,21 @@
+{
+  "name": "red-video",
+  "private": true,
+  "packageManager": "pnpm@10.34.8",
+  "engines": {
+    "node": ">=24.22.3 <25"
+  },
+  "scripts": {
+    "db:generate": "corepack pnpm --filter @red-video/api db:generate",
+    "db:migrate": "corepack pnpm --filter @red-video/api db:migrate",
+    "db:status": "corepack pnpm --filter @red-video/api db:status",
+    "api:build": "corepack pnpm --filter @red-video/api build",
+    "api:start": "corepack pnpm --filter @red-video/api start",
+    "admin:dev": "corepack pnpm --filter @red-video/admin dev",
+    "admin:build": "corepack pnpm --filter @red-video/admin build",
+    "admin:create-user": "corepack pnpm --filter @red-video/api admin:create",
+    "media:worker": "corepack pnpm --filter @red-video/api media:worker",
+    "frontend:dev": "corepack pnpm --filter @red-video/frontend dev",
+    "frontend:build": "corepack pnpm --filter @red-video/frontend build"
+  }
+}
